@@ -1,0 +1,484 @@
+# =============================================================================
+# Atlas-06: Observability Stack — Deploy Pipeline
+# =============================================================================
+# Pattern: Inline AzureCLI@2 bash (no templates, no variable templates)
+# Pipeline is intentionally simple — complexity lives in monitoring stack config
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+resources:
+  repositories:
+    - repository: atlas-platform-app
+      type: git
+      name: Atlas-Platform/atlas-platform-app
+
+variables:
+  serviceConnection: 'MI-ADO-API'
+  terraformVersion: '1.9.8'
+  kubePrometheusStackVersion: '67.10.0'
+  kubecostVersion: '2.5.1'
+  appNamespace: 'dev'
+  monitoringNamespace: 'monitoring'
+  kubecostNamespace: 'kubecost'
+  imageTag: '$(Build.BuildId)'
+
+# =============================================================================
+# Stage 1: Bootstrap — ensure tfstate backend exists
+# =============================================================================
+stages:
+  - stage: Bootstrap
+    displayName: '🔧 Bootstrap Backend'
+    jobs:
+      - job: EnsureBackend
+        displayName: 'Create tfstate storage (idempotent)'
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Ensure storage account + container'
+            inputs:
+              azureSubscription: '$(serviceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+
+                RG="rg-atlas-tfstate"
+                SA="atlastfstate2606"
+                CONTAINER="tfstate"
+                LOCATION="centralindia"
+
+                echo "--- Ensuring resource group ---"
+                az group create --name "$RG" --location "$LOCATION" --output none 2>/dev/null || true
+
+                echo "--- Ensuring storage account ---"
+                EXISTS=$(az storage account check-name --name "$SA" --query 'nameAvailable' -o tsv)
+                if [ "$EXISTS" = "true" ]; then
+                  az storage account create \
+                    --name "$SA" --resource-group "$RG" --location "$LOCATION" \
+                    --sku Standard_LRS --kind StorageV2 --output none
+                  echo "  Created storage account: $SA"
+                else
+                  echo "  Storage account exists: $SA"
+                fi
+
+                echo "--- Ensuring blob container ---"
+                az storage container create \
+                  --name "$CONTAINER" --account-name "$SA" \
+                  --auth-mode login --output none 2>/dev/null || true
+                echo "  Container ready: $CONTAINER"
+
+  # =============================================================================
+  # Stage 2: Infrastructure — Terraform provision AKS + ACR
+  # =============================================================================
+  - stage: Infrastructure
+    displayName: '🏗️ Infrastructure'
+    dependsOn: Bootstrap
+    jobs:
+      - deployment: ProvisionInfra
+        displayName: 'Terraform Apply'
+        environment: 'atlas-06-deploy'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Install Terraform'
+                  inputs:
+                    azureSubscription: '$(serviceConnection)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    addSpnToEnvironment: true
+                    inlineScript: |
+                      set -euo pipefail
+                      echo "--- Installing Terraform $(terraformVersion) ---"
+                      wget -q "https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip"
+                      unzip -qo "terraform_$(terraformVersion)_linux_amd64.zip" -d /usr/local/bin/
+                      terraform version
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Init + Plan + Apply'
+                  inputs:
+                    azureSubscription: '$(serviceConnection)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    addSpnToEnvironment: true
+                    inlineScript: |
+                      set -euo pipefail
+
+                      # OIDC auth for Terraform
+                      export ARM_USE_OIDC=true
+                      export ARM_CLIENT_ID=$servicePrincipalId
+                      export ARM_TENANT_ID=$tenantId
+                      export ARM_OIDC_TOKEN=$idToken
+                      export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+
+                      cd terraform
+
+                      echo "--- Terraform Init ---"
+                      terraform init -input=false
+
+                      echo "--- Terraform Plan ---"
+                      terraform plan -var-file=environments/dev.tfvars -out=tfplan -input=false
+
+                      echo "--- Terraform Apply ---"
+                      terraform apply tfplan
+
+                      echo "--- Saving outputs ---"
+                      terraform output -json > $(Build.ArtifactStagingDirectory)/tf-outputs.json
+                      cat $(Build.ArtifactStagingDirectory)/tf-outputs.json
+
+                - task: PublishPipelineArtifact@1
+                  displayName: 'Publish TF Outputs'
+                  inputs:
+                    targetPath: '$(Build.ArtifactStagingDirectory)/tf-outputs.json'
+                    artifactName: 'tf-outputs'
+
+  # =============================================================================
+  # Stage 3: Build — Docker build + Trivy scan + ACR push
+  # =============================================================================
+  - stage: Build
+    displayName: '🐳 Build + Scan + Push'
+    dependsOn: Infrastructure
+    jobs:
+      - job: BuildAndPush
+        displayName: 'Docker Build → Trivy → ACR'
+        steps:
+          - checkout: self
+          - checkout: atlas-platform-app
+            path: atlas-platform-app
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download TF Outputs'
+            inputs:
+              artifactName: 'tf-outputs'
+              targetPath: '$(Pipeline.Workspace)/tf-outputs'
+
+          - task: AzureCLI@2
+            displayName: 'Build + Scan + Push'
+            inputs:
+              azureSubscription: '$(serviceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+
+                # Parse TF outputs
+                TF_OUT="$(Pipeline.Workspace)/tf-outputs/tf-outputs.json"
+                ACR_NAME=$(jq -r '.acr_name.value' "$TF_OUT")
+                ACR_SERVER=$(jq -r '.acr_login_server.value' "$TF_OUT")
+                IMAGE="${ACR_SERVER}/atlas-platform-app:$(imageTag)"
+
+                echo "=== Build Config ==="
+                echo "  ACR: $ACR_SERVER"
+                echo "  Image: $IMAGE"
+
+                # --- Docker Build ---
+                echo ""
+                echo "--- Docker Build ---"
+                APP_DIR="$(Pipeline.Workspace)/atlas-platform-app"
+                docker build -t "$IMAGE" -f "$(Build.SourcesDirectory)/atlas-06-observability-stack/Dockerfile" "$APP_DIR"
+
+                echo "  Image size:"
+                docker images "$IMAGE" --format "  {{.Size}}"
+
+                # --- Trivy Scan ---
+                echo ""
+                echo "--- Installing Trivy ---"
+                wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+                echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
+                sudo apt-get update -qq && sudo apt-get install -y -qq trivy
+
+                echo ""
+                echo "--- Trivy Scan (CRITICAL=0 policy) ---"
+                trivy image --severity CRITICAL --exit-code 1 --no-progress "$IMAGE"
+                echo "  PASSED: Zero critical CVEs"
+
+                echo ""
+                echo "--- SBOM Generation ---"
+                trivy image --format spdx-json --output sbom.json "$IMAGE"
+                echo "  SBOM generated: sbom.json ($(wc -c < sbom.json) bytes)"
+
+                # --- ACR Login + Push (same step — token expiry fix) ---
+                echo ""
+                echo "--- ACR Push ---"
+                az acr login --name "$ACR_NAME"
+                docker push "$IMAGE"
+                echo "  Pushed: $IMAGE"
+
+  # =============================================================================
+  # Stage 4: Deploy App — Helm install atlas-platform-app
+  # =============================================================================
+  - stage: DeployApp
+    displayName: '🚀 Deploy App'
+    dependsOn: Build
+    jobs:
+      - job: HelmDeployApp
+        displayName: 'Helm install atlas-platform-app'
+        steps:
+          - checkout: self
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download TF Outputs'
+            inputs:
+              artifactName: 'tf-outputs'
+              targetPath: '$(Pipeline.Workspace)/tf-outputs'
+
+          - task: AzureCLI@2
+            displayName: 'Deploy app to AKS'
+            inputs:
+              azureSubscription: '$(serviceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+
+                # Parse TF outputs
+                TF_OUT="$(Pipeline.Workspace)/tf-outputs/tf-outputs.json"
+                RG_NAME=$(jq -r '.resource_group_name.value' "$TF_OUT")
+                AKS_NAME=$(jq -r '.aks_cluster_name.value' "$TF_OUT")
+                ACR_SERVER=$(jq -r '.acr_login_server.value' "$TF_OUT")
+                IMAGE="${ACR_SERVER}/atlas-platform-app"
+
+                # Get AKS credentials
+                echo "--- Getting AKS credentials ---"
+                az aks get-credentials --resource-group "$RG_NAME" --name "$AKS_NAME" --overwrite-existing
+
+                # Create namespace
+                kubectl create namespace $(appNamespace) --dry-run=client -o yaml | kubectl apply -f -
+
+                # Helm deploy app
+                echo ""
+                echo "--- Helm install atlas-platform-app ---"
+                helm upgrade --install atlas-platform-dev \
+                  charts/atlas-platform \
+                  --namespace $(appNamespace) \
+                  --set image.repository="$IMAGE" \
+                  --set image.tag="$(imageTag)" \
+                  --wait --timeout 300s
+
+                # Smoke test
+                echo ""
+                echo "--- Smoke Test ---"
+                kubectl rollout status deployment/atlas-platform-dev -n $(appNamespace) --timeout=120s
+                POD=$(kubectl get pods -n $(appNamespace) -l app.kubernetes.io/name=atlas-platform -o jsonpath='{.items[0].metadata.name}')
+                kubectl exec "$POD" -n $(appNamespace) -- \
+                  python -c "import urllib.request; resp=urllib.request.urlopen('http://localhost:8000/health'); print(f'Health: {resp.read().decode()}')"
+                echo "  App is healthy."
+
+  # =============================================================================
+  # Stage 5: Deploy Monitoring — Prometheus + Kubecost + Alerts + Dashboard
+  # =============================================================================
+  - stage: DeployMonitoring
+    displayName: '📊 Deploy Monitoring'
+    dependsOn: DeployApp
+    jobs:
+      - job: DeployStack
+        displayName: 'Prometheus + Kubecost + Alerts + Dashboard'
+        steps:
+          - checkout: self
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download TF Outputs'
+            inputs:
+              artifactName: 'tf-outputs'
+              targetPath: '$(Pipeline.Workspace)/tf-outputs'
+
+          - task: AzureCLI@2
+            displayName: 'Install kube-prometheus-stack'
+            inputs:
+              azureSubscription: '$(serviceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+
+                # Parse TF outputs + get AKS creds
+                TF_OUT="$(Pipeline.Workspace)/tf-outputs/tf-outputs.json"
+                RG_NAME=$(jq -r '.resource_group_name.value' "$TF_OUT")
+                AKS_NAME=$(jq -r '.aks_cluster_name.value' "$TF_OUT")
+                az aks get-credentials --resource-group "$RG_NAME" --name "$AKS_NAME" --overwrite-existing
+
+                # Create monitoring namespace
+                kubectl create namespace $(monitoringNamespace) --dry-run=client -o yaml | kubectl apply -f -
+
+                # --- kube-prometheus-stack ---
+                echo "--- Adding Helm repos ---"
+                helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+                helm repo update
+
+                echo ""
+                echo "--- Installing kube-prometheus-stack $(kubePrometheusStackVersion) ---"
+                echo "  This deploys: Prometheus, Grafana, AlertManager, Node Exporter, kube-state-metrics"
+
+                # Uninstall stuck release if exists (from failed previous runs)
+                helm uninstall kube-prometheus-stack -n $(monitoringNamespace) 2>/dev/null || true
+
+                helm upgrade --install kube-prometheus-stack \
+                  prometheus-community/kube-prometheus-stack \
+                  --version $(kubePrometheusStackVersion) \
+                  --namespace $(monitoringNamespace) \
+                  --values monitoring/prometheus-stack-values.yaml \
+                  --wait --timeout 600s
+
+                echo "  kube-prometheus-stack installed."
+
+                # --- Apply custom alert rules ---
+                echo ""
+                echo "--- Applying PrometheusRule CRDs ---"
+                kubectl apply -f monitoring/alerts/app-alerts.yaml
+                kubectl apply -f monitoring/alerts/pod-alerts.yaml
+                kubectl apply -f monitoring/alerts/node-alerts.yaml
+                echo "  3 PrometheusRule CRDs applied."
+
+                # --- Provision Grafana dashboard via ConfigMap ---
+                echo ""
+                echo "--- Provisioning Grafana dashboard ---"
+                kubectl create configmap atlas-app-dashboard \
+                  --from-file=atlas-app-dashboard.json=monitoring/dashboards/atlas-app-dashboard.json \
+                  -n $(monitoringNamespace) \
+                  --dry-run=client -o yaml | kubectl apply -f -
+                kubectl label configmap atlas-app-dashboard \
+                  -n $(monitoringNamespace) \
+                  grafana_dashboard=1 --overwrite
+                echo "  Dashboard ConfigMap created. Grafana sidecar will auto-import."
+
+          - task: AzureCLI@2
+            displayName: 'Install Kubecost'
+            inputs:
+              azureSubscription: '$(serviceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+
+                # Parse TF outputs + get AKS creds
+                TF_OUT="$(Pipeline.Workspace)/tf-outputs/tf-outputs.json"
+                RG_NAME=$(jq -r '.resource_group_name.value' "$TF_OUT")
+                AKS_NAME=$(jq -r '.aks_cluster_name.value' "$TF_OUT")
+                az aks get-credentials --resource-group "$RG_NAME" --name "$AKS_NAME" --overwrite-existing
+
+                # --- Kubecost ---
+                echo "--- Adding Kubecost Helm repo ---"
+                helm repo add kubecost https://kubecost.github.io/cost-analyzer/
+                helm repo update
+
+                kubectl create namespace $(kubecostNamespace) --dry-run=client -o yaml | kubectl apply -f -
+
+                echo ""
+                echo "--- Installing Kubecost $(kubecostVersion) ---"
+                helm uninstall kubecost -n $(kubecostNamespace) 2>/dev/null || true
+
+                helm upgrade --install kubecost \
+                  kubecost/cost-analyzer \
+                  --version $(kubecostVersion) \
+                  --namespace $(kubecostNamespace) \
+                  --values monitoring/kubecost-values.yaml \
+                  --wait --timeout 300s
+
+                echo "  Kubecost installed. Uses existing Prometheus at kube-prometheus-stack-prometheus.monitoring.svc:9090"
+
+  # =============================================================================
+  # Stage 6: Verify — confirm everything is running
+  # =============================================================================
+  - stage: Verify
+    displayName: '✅ Verify'
+    dependsOn: DeployMonitoring
+    jobs:
+      - job: VerifyAll
+        displayName: 'Verify all components'
+        steps:
+          - checkout: self
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download TF Outputs'
+            inputs:
+              artifactName: 'tf-outputs'
+              targetPath: '$(Pipeline.Workspace)/tf-outputs'
+
+          - task: AzureCLI@2
+            displayName: 'Verify deployment'
+            inputs:
+              azureSubscription: '$(serviceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+
+                # Get AKS creds
+                TF_OUT="$(Pipeline.Workspace)/tf-outputs/tf-outputs.json"
+                RG_NAME=$(jq -r '.resource_group_name.value' "$TF_OUT")
+                AKS_NAME=$(jq -r '.aks_cluster_name.value' "$TF_OUT")
+                az aks get-credentials --resource-group "$RG_NAME" --name "$AKS_NAME" --overwrite-existing
+
+                echo "=============================================="
+                echo "  ATLAS-06 OBSERVABILITY STACK — VERIFICATION"
+                echo "=============================================="
+
+                echo ""
+                echo "--- App Pods (namespace: $(appNamespace)) ---"
+                kubectl get pods -n $(appNamespace) -o wide
+                echo ""
+
+                echo "--- Monitoring Pods (namespace: $(monitoringNamespace)) ---"
+                kubectl get pods -n $(monitoringNamespace) -o wide
+                echo ""
+
+                echo "--- Kubecost Pods (namespace: $(kubecostNamespace)) ---"
+                kubectl get pods -n $(kubecostNamespace) -o wide
+                echo ""
+
+                echo "--- ServiceMonitors ---"
+                kubectl get servicemonitor -A
+                echo ""
+
+                echo "--- PrometheusRules ---"
+                kubectl get prometheusrule -n $(monitoringNamespace)
+                echo ""
+
+                echo "--- Dashboard ConfigMap ---"
+                kubectl get configmap atlas-app-dashboard -n $(monitoringNamespace) --show-labels
+                echo ""
+
+                echo "--- Services ---"
+                kubectl get svc -n $(monitoringNamespace)
+                echo ""
+
+                # Verify key pods are Running
+                echo "--- Health Checks ---"
+                PROM_READY=$(kubectl get pods -n $(monitoringNamespace) -l app.kubernetes.io/name=prometheus -o jsonpath='{.items[*].status.phase}')
+                GRAFANA_READY=$(kubectl get pods -n $(monitoringNamespace) -l app.kubernetes.io/name=grafana -o jsonpath='{.items[*].status.phase}')
+                APP_READY=$(kubectl get pods -n $(appNamespace) -l app.kubernetes.io/name=atlas-platform -o jsonpath='{.items[*].status.phase}')
+
+                echo "  Prometheus: $PROM_READY"
+                echo "  Grafana:    $GRAFANA_READY"
+                echo "  App:        $APP_READY"
+
+                echo ""
+                echo "=============================================="
+                echo "  DEPLOYMENT COMPLETE"
+                echo "=============================================="
+                echo ""
+                echo "  Next steps (from your local machine):"
+                echo "  1. az aks get-credentials --resource-group $RG_NAME --name $AKS_NAME"
+                echo "  2. kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n $(monitoringNamespace)"
+                echo "  3. Open http://localhost:3000 — login: admin / atlas-admin"
+                echo "  4. Run: ./scripts/generate-load.sh"
+                echo "  5. Watch the dashboard populate"
+                echo "  6. Run: ./scripts/trigger-failure.sh"
+                echo "  7. Watch alerts fire"
+                echo "  8. Screenshot everything for README"
+                echo ""

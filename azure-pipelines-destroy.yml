@@ -1,0 +1,75 @@
+# =============================================================================
+# Atlas-06: Observability Stack — Destroy Pipeline
+# =============================================================================
+# Tears down ALL Azure resources. Approval gate on atlas-06-destroy environment.
+# =============================================================================
+
+trigger: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  serviceConnection: 'MI-ADO-API'
+  terraformVersion: '1.9.8'
+
+stages:
+  - stage: Destroy
+    displayName: '💥 Destroy Infrastructure'
+    jobs:
+      - deployment: TerraformDestroy
+        displayName: 'Terraform Destroy'
+        environment: 'atlas-06-destroy'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Install Terraform'
+                  inputs:
+                    azureSubscription: '$(serviceConnection)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    addSpnToEnvironment: true
+                    inlineScript: |
+                      set -euo pipefail
+                      wget -q "https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip"
+                      unzip -qo "terraform_$(terraformVersion)_linux_amd64.zip" -d /usr/local/bin/
+                      terraform version
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Destroy'
+                  inputs:
+                    azureSubscription: '$(serviceConnection)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    addSpnToEnvironment: true
+                    inlineScript: |
+                      set -euo pipefail
+
+                      export ARM_USE_OIDC=true
+                      export ARM_CLIENT_ID=$servicePrincipalId
+                      export ARM_TENANT_ID=$tenantId
+                      export ARM_OIDC_TOKEN=$idToken
+                      export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+
+                      cd terraform
+
+                      echo "--- Terraform Init ---"
+                      terraform init -input=false
+
+                      echo "--- Terraform Destroy ---"
+                      terraform destroy -var-file=environments/dev.tfvars -auto-approve
+
+                      echo "--- Verifying resource group deleted ---"
+                      if az group show --name "rg-atlas-06-dev" &>/dev/null; then
+                        echo "WARNING: Resource group still exists. Check Azure Portal."
+                      else
+                        echo "CONFIRMED: rg-atlas-06-dev deleted."
+                      fi
+
+                      echo ""
+                      echo "=== DESTROY COMPLETE ==="
+                      echo "Verify in Azure Portal: Resource Groups → confirm rg-atlas-06-dev is gone"
