@@ -268,7 +268,7 @@ stages:
                 echo ""
                 echo "--- Smoke Test ---"
                 kubectl rollout status deployment/atlas-platform-dev -n $(appNamespace) --timeout=120s
-                POD=$(kubectl get pods -n $(appNamespace) -l app.kubernetes.io/name=atlas-platform -o jsonpath='{.items[0].metadata.name}')
+                POD=$(kubectl get pods -n $(appNamespace) -l app.kubernetes.io/name=atlas-platform --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
                 kubectl exec "$POD" -n $(appNamespace) -- \
                   python -c "import urllib.request; resp=urllib.request.urlopen('http://localhost:8000/health'); print(f'Health: {resp.read().decode()}')"
                 echo "  App is healthy."
