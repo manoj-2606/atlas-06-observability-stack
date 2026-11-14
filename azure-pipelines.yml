@@ -5,10 +5,7 @@
 # Pipeline is intentionally simple — complexity lives in monitoring stack config
 # =============================================================================
 
-trigger:
-  branches:
-    include:
-      - main
+trigger: none
 
 pool:
   vmImage: 'ubuntu-latest'
