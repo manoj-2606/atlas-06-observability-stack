@@ -7,7 +7,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 team: {{ .Values.labels.team | default "platform" }}
-cost-center: {{ .Values.labels.cost-center | default "atlas-learning" }}
+cost-center: {{ index .Values.labels "cost-center" | default "atlas-learning" }}
 {{- end -}}
 
 {{/*
