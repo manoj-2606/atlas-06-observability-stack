@@ -1,0 +1,50 @@
+# =============================================================================
+# Default values for atlas-platform-app
+# Overridden by pipeline via --set flags
+# =============================================================================
+
+replicaCount: 1
+
+image:
+  repository: ""     # Set by pipeline: <acr_login_server>/atlas-platform-app
+  tag: "latest"      # Set by pipeline: Build.BuildId
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+probes:
+  liveness:
+    path: /health
+    port: 8000
+    initialDelaySeconds: 10
+    periodSeconds: 15
+  readiness:
+    path: /health
+    port: 8000
+    initialDelaySeconds: 5
+    periodSeconds: 10
+
+env:
+  APP_ENV: "dev"
+
+# ServiceMonitor for Prometheus scraping
+serviceMonitor:
+  enabled: true
+  interval: 15s
+  path: /metrics
+  port: http
+
+labels:
+  team: platform
+  cost-center: atlas-learning

@@ -1,0 +1,37 @@
+{{- if .Values.serviceMonitor.enabled }}
+# =============================================================================
+# ServiceMonitor — tells Prometheus to scrape this app
+# =============================================================================
+# This is a CRD installed by kube-prometheus-stack. It replaces the old
+# prometheus.io/scrape annotations with a declarative, label-matched approach.
+#
+# How it works:
+#   1. kube-prometheus-stack installs the ServiceMonitor CRD
+#   2. Prometheus Operator watches for ServiceMonitor resources
+#   3. This ServiceMonitor says: "find Services matching my selector labels
+#      and scrape their /metrics endpoint every 15s"
+#   4. Prometheus adds the target to its scrape config automatically
+#
+# CRITICAL: The label "release: kube-prometheus-stack" MUST match the Helm
+# release name of kube-prometheus-stack. Without it, Prometheus Operator
+# won't discover this ServiceMonitor. This is the #1 debugging pain point.
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "atlas-platform.fullname" . }}
+  labels:
+    {{- include "atlas-platform.labels" . | nindent 4 }}
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "atlas-platform.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: {{ .Values.serviceMonitor.port }}
+      path: {{ .Values.serviceMonitor.path }}
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}
