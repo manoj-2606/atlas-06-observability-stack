@@ -27,13 +27,17 @@ probes:
   liveness:
     path: /health
     port: 8000
-    initialDelaySeconds: 10
+    initialDelaySeconds: 30
     periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 5
   readiness:
     path: /health
     port: 8000
-    initialDelaySeconds: 5
+    initialDelaySeconds: 10
     periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
 
 env:
   APP_ENV: "dev"
