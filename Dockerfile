@@ -25,7 +25,7 @@ RUN groupadd -r appuser && useradd -r -g appuser -s /sbin/nologin appuser
 # Copy installed packages + app source
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /usr/local/bin/uvicorn /usr/local/bin/uvicorn
-COPY --from=builder /build/app ./app/
+COPY --from=builder /build/app .
 
 # Security: non-root execution
 USER appuser
