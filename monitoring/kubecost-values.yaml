@@ -15,6 +15,7 @@ global:
 
 # Kubecost model — the cost calculation engine
 kubecostModel:
+  image: public.ecr.aws/kubecost/cost-model
   resources:
     requests:
       cpu: 50m
@@ -25,6 +26,7 @@ kubecostModel:
 
 # Kubecost frontend
 kubecostFrontend:
+  image: public.ecr.aws/kubecost/frontend
   resources:
     requests:
       cpu: 50m

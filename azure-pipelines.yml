@@ -378,10 +378,6 @@ stages:
                 az aks get-credentials --resource-group "$RG_NAME" --name "$AKS_NAME" --overwrite-existing
 
                 # --- Kubecost ---
-                echo "--- Adding Kubecost Helm repo ---"
-                helm repo add kubecost https://kubecost.github.io/cost-analyzer/
-                helm repo update
-
                 kubectl create namespace $(kubecostNamespace) --dry-run=client -o yaml | kubectl apply -f -
 
                 echo ""
@@ -389,11 +385,11 @@ stages:
                 helm uninstall kubecost -n $(kubecostNamespace) 2>/dev/null || true
 
                 helm upgrade --install kubecost \
-                  kubecost/cost-analyzer \
+                  oci://public.ecr.aws/kubecost/cost-analyzer \
                   --version $(kubecostVersion) \
                   --namespace $(kubecostNamespace) \
                   --values monitoring/kubecost-values.yaml \
-                  --wait --timeout 300s
+                  --wait --timeout 600s
 
                 echo "  Kubecost installed. Uses existing Prometheus at kube-prometheus-stack-prometheus.monitoring.svc:9090"
 
