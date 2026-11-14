@@ -1,0 +1,89 @@
+# =============================================================================
+# App Alerts — error rate + latency thresholds
+# =============================================================================
+# These fire when atlas-platform-app is degraded.
+# Trigger with: POST /simulate/failure
+#
+# NOTE: Metric names (http_requests_total, http_request_duration_seconds_bucket)
+# must match what atlas-platform-app's /metrics endpoint exports.
+# Verify after first deployment:
+#   kubectl exec $POD -n dev -- python -c \
+#     "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/metrics').read().decode())"
+# If the app uses different names (e.g., fastapi_requests_total), update below.
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: atlas-app-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack    # MUST match Helm release name
+    app: atlas-platform
+spec:
+  groups:
+    - name: atlas-app-alerts
+      rules:
+        # -----------------------------------------------------------------
+        # High Error Rate
+        # What: percentage of 5xx responses in last 5 minutes
+        # Why 1%: SLO is 99.9% availability → 0.1% error budget.
+        #   1% error rate = burning 10x the budget. Critical.
+        # for 2m: avoids alerting on single-request spikes
+        # -----------------------------------------------------------------
+        - alert: HighErrorRate
+          expr: |
+            (
+              sum(rate(http_requests_total{status=~"5..", namespace="dev"}[5m]))
+              /
+              sum(rate(http_requests_total{namespace="dev"}[5m]))
+            ) * 100 > 1
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Error rate above 1% for atlas-platform-app"
+            description: "Current error rate: {{ $value | printf \"%.2f\" }}%. SLO threshold: 0.1%. Investigate immediately."
+            runbook: "Check /simulate/failure was not triggered. Check pod logs: kubectl logs -l app.kubernetes.io/name=atlas-platform -n dev"
+
+        # -----------------------------------------------------------------
+        # High Latency (P95)
+        # What: 95th percentile response time exceeds 500ms
+        # Why 500ms: SLO target is p95 < 200ms. 500ms = degraded, not dead.
+        # severity: warning (not critical) — latency spikes are common
+        # -----------------------------------------------------------------
+        - alert: HighLatencyP95
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(http_request_duration_seconds_bucket{namespace="dev"}[5m])) by (le)
+            ) > 0.5
+          for: 2m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "P95 latency above 500ms"
+            description: "Current P95: {{ $value | printf \"%.3f\" }}s. SLO target: 0.2s. Check /simulate/load was not triggered."
+
+        # -----------------------------------------------------------------
+        # Error Budget Burn Rate
+        # What: error budget consumed faster than sustainable
+        # Why: if burn rate stays this high, SLO will be breached within hours
+        # 0.001 = 0.1% error rate (matches 99.9% SLO)
+        # -----------------------------------------------------------------
+        - alert: ErrorBudgetBurnHigh
+          expr: |
+            (
+              1 - (
+                sum(rate(http_requests_total{status!~"5..", namespace="dev"}[1h]))
+                /
+                sum(rate(http_requests_total{namespace="dev"}[1h]))
+              )
+            ) > 0.001
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Error budget burn rate exceeds SLO threshold"
+            description: "Burn rate: {{ $value | printf \"%.4f\" }}. At this rate, 99.9% SLO will be breached."

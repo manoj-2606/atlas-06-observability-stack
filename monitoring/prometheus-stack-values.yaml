@@ -1,0 +1,172 @@
+# =============================================================================
+# kube-prometheus-stack — Helm values override
+# =============================================================================
+# Chart: prometheus-community/kube-prometheus-stack
+# This chart deploys: Prometheus, Grafana, AlertManager, Node Exporter,
+#   kube-state-metrics, and Prometheus Operator (manages CRDs).
+#
+# These overrides slim the stack for 2x B2s nodes (8GB total).
+# Default values would OOMKill on B2s — every component has resource limits.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Prometheus — time-series database, scrapes /metrics endpoints
+# -----------------------------------------------------------------------------
+prometheus:
+  prometheusSpec:
+    # Ephemeral cluster — no point keeping data longer than a demo session
+    retention: 2h
+
+    # Scrape interval: how often Prometheus pulls metrics from targets
+    # 15s = default, good balance of resolution vs resource usage
+    scrapeInterval: 15s
+
+    # Evaluation interval: how often Prometheus evaluates alert rules
+    evaluationInterval: 15s
+
+    # Resource limits — CRITICAL for B2s nodes
+    # Without these, Prometheus requests 2Gi+ and OOMKills
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 768Mi
+
+    # No persistent storage — ephemeral cluster, destroyed end-of-day
+    storageSpec: {}
+
+    # ServiceMonitor selector — pick up ServiceMonitors with release label
+    # This is how Prometheus discovers our app's ServiceMonitor
+    serviceMonitorSelectorNilUsesHelmValues: false
+
+    # PrometheusRule selector — pick up all PrometheusRule CRDs
+    # Without this, custom alert rules are silently ignored
+    ruleSelectorNilUsesHelmValues: false
+
+# -----------------------------------------------------------------------------
+# Grafana — visualization dashboards
+# -----------------------------------------------------------------------------
+grafana:
+  # Admin password — portfolio demo only. NEVER hardcode in production.
+  # Production: use Azure Key Vault + CSI driver (P9 pattern)
+  adminPassword: "atlas-admin"
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+  # Sidecar: watches for ConfigMaps with label grafana_dashboard=1
+  # and auto-imports them as dashboards. This is how we provision
+  # dashboards as code — no manual UI clicking.
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      # Search in all namespaces for dashboard ConfigMaps
+      searchNamespace: ALL
+
+  # Default datasource is auto-configured to point at this Prometheus instance
+
+# -----------------------------------------------------------------------------
+# AlertManager — alert routing and grouping
+# -----------------------------------------------------------------------------
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+
+  # Alert routing configuration
+  config:
+    global:
+      resolve_timeout: 5m
+
+    # Route tree: how alerts are matched to receivers
+    route:
+      # Default receiver if no child route matches
+      receiver: "default-webhook"
+
+      # Group alerts by these labels — reduces alert spam
+      # e.g., 10 pods crash-looping = 1 grouped alert, not 10
+      group_by: ["alertname", "namespace", "severity"]
+
+      # Wait 30s to collect more alerts before sending the first notification
+      group_wait: 30s
+
+      # Wait 5m before sending updates for an already-firing alert group
+      group_interval: 5m
+
+      # Re-send an unresolved alert every 4h
+      repeat_interval: 4h
+
+      # Child routes: match by severity label
+      routes:
+        - receiver: "critical-webhook"
+          matchers:
+            - severity = critical
+          continue: false
+
+        - receiver: "warning-webhook"
+          matchers:
+            - severity = warning
+          continue: false
+
+    # Receivers: where alerts are sent
+    # In production: Slack, PagerDuty, OpsGenie, email
+    # For portfolio: webhook.site (free, temporary) or just configure structure
+    receivers:
+      - name: "default-webhook"
+        webhook_configs:
+          - url: "http://localhost:9093/api/v2/alerts"
+            send_resolved: true
+
+      - name: "critical-webhook"
+        webhook_configs:
+          - url: "http://localhost:9093/api/v2/alerts"
+            send_resolved: true
+
+      - name: "warning-webhook"
+        webhook_configs:
+          - url: "http://localhost:9093/api/v2/alerts"
+            send_resolved: true
+
+# -----------------------------------------------------------------------------
+# Node Exporter — DaemonSet, exposes node-level metrics (CPU, RAM, disk)
+# -----------------------------------------------------------------------------
+nodeExporter:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+# -----------------------------------------------------------------------------
+# kube-state-metrics — K8s object state as metrics (pod status, replicas)
+# -----------------------------------------------------------------------------
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+# -----------------------------------------------------------------------------
+# CRDs — install ServiceMonitor, PrometheusRule, etc.
+# -----------------------------------------------------------------------------
+crds:
+  enabled: true

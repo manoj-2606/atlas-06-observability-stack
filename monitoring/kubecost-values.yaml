@@ -1,0 +1,51 @@
+# =============================================================================
+# Kubecost — Kubernetes cost monitoring
+# =============================================================================
+# Shows cost per namespace, deployment, pod. The FinOps tool for K8s.
+# Chart: oci://public.ecr.aws/kubecost/cost-analyzer
+#
+# Slimmed down for B2s nodes — disable heavy components.
+# =============================================================================
+
+# Use existing Prometheus from kube-prometheus-stack (don't deploy a second one)
+global:
+  prometheus:
+    enabled: false
+    fqdn: "http://kube-prometheus-stack-prometheus.monitoring.svc:9090"
+
+# Kubecost model — the cost calculation engine
+kubecostModel:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+# Kubecost frontend
+kubecostFrontend:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+# Disable network cost DaemonSet — heavy, not needed for portfolio demo
+networkCosts:
+  enabled: false
+
+# No persistent storage — ephemeral cluster
+persistentVolume:
+  enabled: false
+
+# Disable Prometheus bundled with Kubecost (we already have one)
+prometheus:
+  server:
+    enabled: false
+  nodeExporter:
+    enabled: false
+  kube-state-metrics:
+    enabled: false

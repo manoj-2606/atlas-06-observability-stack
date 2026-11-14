@@ -1,0 +1,63 @@
+# =============================================================================
+# Node Alerts — CPU + Memory pressure on AKS worker nodes
+# =============================================================================
+# These fire when the underlying infrastructure is stressed.
+# Trigger with: POST /simulate/load {"cpu": 80, "duration": 120}
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: atlas-node-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+    app: atlas-platform
+spec:
+  groups:
+    - name: atlas-node-alerts
+      rules:
+        # -----------------------------------------------------------------
+        # High Node CPU
+        # What: average CPU usage across all cores exceeds 80%
+        # How: node_cpu_seconds_total is a counter. rate() gives per-second
+        #   CPU time. mode="idle" = time doing nothing. 100 - idle% = usage%.
+        # for 5m: sustained pressure, not spikes
+        # -----------------------------------------------------------------
+        - alert: HighNodeCPU
+          expr: |
+            100 - (
+              avg by(instance) (
+                rate(node_cpu_seconds_total{mode="idle"}[5m])
+              ) * 100
+            ) > 80
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Node {{ $labels.instance }} CPU above 80%"
+            description: "Current CPU usage: {{ $value | printf \"%.1f\" }}%. Consider scaling node pool or optimizing workloads."
+
+        # -----------------------------------------------------------------
+        # High Node Memory
+        # What: memory usage exceeds 85%
+        # How: MemAvailable = what the kernel considers available for new
+        #   allocations. (1 - available/total) = usage ratio.
+        # 85% on B2s (4GB) = only 600MB free. Pods will start getting OOMKilled.
+        # -----------------------------------------------------------------
+        - alert: HighNodeMemory
+          expr: |
+            (
+              1 - (
+                node_memory_MemAvailable_bytes
+                /
+                node_memory_MemTotal_bytes
+              )
+            ) * 100 > 85
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Node memory above 85%"
+            description: "Current memory usage: {{ $value | printf \"%.1f\" }}%. On B2s (4GB), this leaves <600MB free. Risk of OOMKills."

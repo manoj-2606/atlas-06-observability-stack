@@ -1,0 +1,69 @@
+# =============================================================================
+# Pod Alerts — CrashLoopBackOff + OOMKilled
+# =============================================================================
+# These fire when pods are unstable.
+# Trigger CrashLoop with: POST /simulate/failure {"type": "crash"}
+# Trigger OOMKill with: POST /simulate/failure {"type": "oom"}
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: atlas-pod-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+    app: atlas-platform
+spec:
+  groups:
+    - name: atlas-pod-alerts
+      rules:
+        # -----------------------------------------------------------------
+        # Pod CrashLooping
+        # What: pod restarted more than 3 times in 15 minutes
+        # Why: CrashLoopBackOff = pod starts, crashes, K8s restarts, repeat.
+        #   Common causes: OOM, unhandled exception, bad config, missing secret.
+        # for 1m: slight delay to filter restarts during deployment rollout
+        # -----------------------------------------------------------------
+        - alert: PodCrashLooping
+          expr: |
+            increase(kube_pod_container_status_restarts_total{namespace="dev"}[15m]) > 3
+          for: 1m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Pod {{ $labels.pod }} is crash looping in {{ $labels.namespace }}"
+            description: "{{ $labels.pod }} restarted {{ $value | printf \"%.0f\" }} times in 15m. Check: kubectl describe pod {{ $labels.pod }} -n {{ $labels.namespace }}"
+
+        # -----------------------------------------------------------------
+        # Pod OOMKilled
+        # What: container terminated because it exceeded memory limit
+        # Why: resource limits too low, memory leak, or unexpected load.
+        # for 0m: fire immediately — OOMKill already happened
+        # -----------------------------------------------------------------
+        - alert: PodOOMKilled
+          expr: |
+            kube_pod_container_status_last_terminated_reason{reason="OOMKilled", namespace="dev"} == 1
+          for: 0m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Pod {{ $labels.pod }} was OOMKilled"
+            description: "Container {{ $labels.container }} in {{ $labels.pod }} exceeded memory limit. Check: kubectl describe pod {{ $labels.pod }} -n {{ $labels.namespace }}"
+
+        # -----------------------------------------------------------------
+        # High Pod Restart Count (1 hour)
+        # What: any restart in the last hour — early warning
+        # severity: warning (not critical) — single restart could be transient
+        # -----------------------------------------------------------------
+        - alert: PodRestartWarning
+          expr: |
+            increase(kube_pod_container_status_restarts_total{namespace="dev"}[1h]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Pod {{ $labels.pod }} restarted in the last hour"
+            description: "Restart count: {{ $value | printf \"%.0f\" }}. Investigate if recurring."
