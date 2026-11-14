@@ -40,7 +40,7 @@ env:
 
 # ServiceMonitor for Prometheus scraping
 serviceMonitor:
-  enabled: true
+  enabled: false
   interval: 15s
   path: /metrics
   port: http

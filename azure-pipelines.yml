@@ -351,6 +351,16 @@ stages:
                   grafana_dashboard=1 --overwrite
                 echo "  Dashboard ConfigMap created. Grafana sidecar will auto-import."
 
+                # --- Enable ServiceMonitor on app (CRDs now exist) ---
+                echo ""
+                echo "--- Enabling ServiceMonitor on atlas-platform-app ---"
+                helm upgrade atlas-platform-dev \
+                  charts/atlas-platform \
+                  --namespace dev \
+                  --set serviceMonitor.enabled=true \
+                  --reuse-values
+                echo "  ServiceMonitor enabled."
+
           - task: AzureCLI@2
             displayName: 'Install Kubecost'
             inputs:
@@ -386,6 +396,8 @@ stages:
                   --wait --timeout 300s
 
                 echo "  Kubecost installed. Uses existing Prometheus at kube-prometheus-stack-prometheus.monitoring.svc:9090"
+
+                
 
   # =============================================================================
   # Stage 6: Verify — confirm everything is running
