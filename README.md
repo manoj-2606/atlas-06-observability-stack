@@ -305,11 +305,88 @@ See [docs/promql-cheatsheet.md](docs/promql-cheatsheet.md) for 5 queries with de
 
 ## Lessons Learned
 
+### What is Prometheus?
+
+Prometheus is a **time-series database (TSDB)** that collects metrics by **pulling** (scraping) data from your application's `/metrics` endpoint at a fixed interval (every 15s in this project). It does not receive data — it reaches out and collects. Every metric is stored as a time-stamped key-value pair with labels (e.g., `http_requests_total{status="200", endpoint="/health"} 45.0`). You query this data using **PromQL**, Prometheus's query language. Prometheus also evaluates **alert rules** — PromQL expressions with thresholds — and sends firing alerts to AlertManager.
+
+**Key components deployed by kube-prometheus-stack (single Helm chart):**
+
+| Component | What It Does |
+|-----------|-------------|
+| Prometheus | Scrapes metrics, stores time-series, evaluates alert rules |
+| Prometheus Operator | Manages CRDs: ServiceMonitor (what to scrape), PrometheusRule (alert definitions) |
+| AlertManager | Receives fired alerts, groups them (10 crashing pods = 1 alert), routes by severity to receivers |
+| Node Exporter | DaemonSet exposing node-level metrics (CPU, RAM, disk) on every node |
+| kube-state-metrics | Exposes Kubernetes object state as metrics (pod status, replica counts, restarts) |
+
+### What is Grafana?
+
+Grafana is a **visualization layer** — it does not collect or store any data. It connects to Prometheus as a datasource, runs PromQL queries, and renders the results as panels (line charts, gauges, stat cards). In this project, the dashboard is **provisioned as code**: a JSON file stored in a ConfigMap with the label `grafana_dashboard=1`. Grafana's sidecar container watches for ConfigMaps with that label and auto-imports them — no manual UI clicking, fully reproducible on cluster rebuild.
+
+### Why We Did This
+
+Projects P1–P5 deployed infrastructure and applications with zero monitoring. If the app went down, the only signal was a user complaint. This project proves:
+
+| Capability | What It Proves |
+|-----------|---------------|
+| SLI/SLO discipline | Availability (99.9%), latency (p95 < 200ms), error budget (43.2 min/month) — defined, measured, tracked |
+| Alerting that routes | 8 PrometheusRule definitions across 3 files, routed by severity (critical → critical-webhook, warning → warning-webhook) |
+| Dashboards as code | 8-panel Grafana dashboard provisioned via ConfigMap, version-controlled, reviewable in PR |
+| Cost visibility | Kubecost shows cost per namespace/deployment/pod (FinOps) |
+| Custom metrics | App exports `http_requests_total` and `http_request_duration_seconds` via `/metrics`, scraped by Prometheus via ServiceMonitor CRD |
+
+### How the Data Flows
+
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│                                                                      │
+│  App (/metrics)                                                      │
+│       │                                                              │
+│       ▼                                                              │
+│  ServiceMonitor (tells Prometheus "scrape this Service")             │
+│       │                                                              │
+│       ▼                                                              │
+│  Prometheus (scrapes every 15s, stores in TSDB, evaluates rules)    │
+│       │                                                              │
+│       ├──▶ Grafana (queries via PromQL, renders 8-panel dashboard)   │
+│       │                                                              │
+│       ├──▶ AlertManager (receives fired alerts, groups, routes)      │
+│       │       ├── severity=critical → critical-webhook               │
+│       │       ├── severity=warning  → warning-webhook                │
+│       │       └── default           → default-webhook                │
+│       │                                                              │
+│       └──▶ Kubecost (queries same Prometheus for cost calculation)   │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Critical Concepts Learned
+
+| Concept | What It Means | Why It Matters |
+|---------|--------------|----------------|
+| ServiceMonitor CRD | Declarative scrape config — tells Prometheus "scrape this Service on this port/path" | Without it, Prometheus doesn't know your app exists. Replaces legacy `prometheus.io/scrape` annotations |
+| PrometheusRule CRD | Alert definitions in YAML — PromQL expression + threshold + severity | Must have `labels.release: kube-prometheus-stack` or Prometheus Operator silently ignores them |
+| `serviceMonitorSelectorNilUsesHelmValues: false` | Prometheus discovers ALL ServiceMonitors, not just ones matching the Helm release label | Without this, your app's ServiceMonitor is invisible to Prometheus |
+| `ruleSelectorNilUsesHelmValues: false` | Same for PrometheusRule CRDs | Without this, custom alert rules never fire — no error, no log |
+| Sidecar dashboard provisioning | Grafana sidecar watches ConfigMaps with `grafana_dashboard=1` label | Dashboard survives cluster rebuild — no manual import needed |
+| `--reuse-values` | Helm upgrade carries forward all values from the previous release | Used to enable ServiceMonitor in Stage 5 without re-specifying image/tag from Stage 4 |
+| Error Budget | `1 - SLO target = 0.001 = 43.2 min/month` | At 10x burn rate, budget exhausted in ~4 minutes — this is what triggers the freeze on feature releases |
+| `group_by` in AlertManager | Groups alerts by `alertname`, `namespace`, `severity` | 10 pods crash-looping = 1 grouped alert, not 10 individual notifications |
+
+### Errors Encountered
+
 | # | Stage | Error | Root Cause | Fix | Time Lost |
 |---|-------|-------|------------|-----|-----------|
-| | | | | | |
-
-<!-- Fill after execution -->
+| 1 | Build (Docker) | `COPY app/requirements.txt .` — file not found | Dockerfile assumed `requirements.txt` inside `app/` directory, but it's at repo root | Changed to `COPY requirements.txt .` and `COPY . ./app/` | ~5 min |
+| 2 | Build (Docker) | `Error loading ASGI app. Could not import module "app.main"` | Double-nested directory: `COPY --from=builder /build/app ./app/` created `/app/app/app/main.py` | Changed to `COPY --from=builder /build/app .` so module lands at `/app/app/main.py` | ~10 min |
+| 3 | Build (pip) | SSL EOF errors — pip retries 10 times, fails after 7 minutes | Hosted agent network has flaky SSL to PyPI (Microsoft infra issue) | Added `--trusted-host pypi.org --trusted-host files.pythonhosted.org` | ~15 min |
+| 4 | Deploy App (Helm) | `parse error at (_helpers.tpl:10): bad character U+002D '-'` | Go templates treat hyphen in `.Values.labels.cost-center` as minus operator | Changed to `index .Values.labels "cost-center"` | ~5 min |
+| 5 | Deploy App (Helm) | `no matches for kind "ServiceMonitor"` | App Helm chart includes ServiceMonitor template, but CRDs don't exist until Stage 5 installs kube-prometheus-stack | Made ServiceMonitor conditional with `{{- if .Values.serviceMonitor.enabled }}`, default `false`, enabled in Stage 5 via `--reuse-values` | ~10 min |
+| 6 | Deploy Monitoring (Kubecost) | `ImagePullBackOff` — `403 Forbidden` from `gcr.io/kubecost1/*` | Kubecost migrated images from Google Container Registry to AWS ECR Public, `gcr.io` blocks anonymous pulls | Switched chart source to `oci://public.ecr.aws/kubecost/cost-analyzer`, added ECR image overrides in values | ~15 min |
+| 7 | Deploy Monitoring (Kubecost) | `ImagePullBackOff` on `kubecost-forecasting` pod | Forecasting subcomponent still references `gcr.io`, no ECR override available | Disabled forecasting: `forecasting.enabled: false` — premium feature, not needed for portfolio | ~5 min |
+| 8 | Deploy App (Smoke Test) | `cannot exec into a container in a completed pod` | Old crashed pods from previous failed revisions still exist, jsonpath picks wrong pod | Added `--field-selector=status.phase=Running` to pod selection query | ~5 min |
+| 9 | Deploy App (Smoke Test) | `container not found ("atlas-platform-app")` | Race condition — rollout reports done but container isn't fully ready on slow B2s nodes | Added `sleep 10` after rollout status check, added `-c atlas-platform-app` explicit container flag | ~5 min |
+| 10 | Runtime (CrashLoopBackOff) | App starts, serves 1 health check, then exits with code 1 | Liveness probe kills pod before app stabilizes — `initialDelaySeconds: 10` too aggressive for B2s | Increased to `initialDelaySeconds: 30`, added `timeoutSeconds: 5`, `failureThreshold: 5` in values.yaml and deployment.yaml template | ~10 min |
 
 ## Interview Summary
 
